@@ -4,9 +4,5 @@ desc: 单用户通过 QQ 与微信私聊共享 Vikunja 项目、任务和临期�
 short_desc: QQ 与微信共享的 Vikunja 私人待办秘书。
 version: v0.6.0
 author: Marshall
-repo: "https://github.com/Makarov3821/astrbot_plugin_vikunja"
+repo: "https://github.com/XiRen-Huang/astrbot_plugin_vikunja"
 astrbot_version: ">=4.22.1,<5"
-support_platforms:
-  - qq_official
-  - qq_official_webhook
-  - weixin_oc
