@@ -16,8 +16,10 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .push_channels import AstrBotChannel, build_channels, format_push_status
-from .state_store import StateStore
+from .state_store import AUDIT_LIMIT, StateStore
 from .todo_domain import (
+    AUDIT_DISPLAY_LIMIT,
+    AUDIT_TASK_REF_LIMIT,
     AddSpec,
     BulkSpec,
     EditSpec,
@@ -30,8 +32,10 @@ from .todo_domain import (
     completed_tasks_since,
     filter_tasks_by_label,
     filter_tasks_by_query,
+    format_deletion_audit,
     format_label_list,
     format_project_tree,
+    format_task_detail,
     format_subtask_list,
     format_task_list,
     format_weekly_report,
@@ -59,6 +63,7 @@ from .todo_domain import (
     secretary_clarification_reason,
     select_tasks,
     subtasks_of,
+    summarize_task_refs,
     task_label_titles,
     task_sort_key,
     to_vikunja_time,
@@ -79,6 +84,7 @@ HELP_TEXT = """Vikunja 私人待办秘书（仅支持私聊）
 /todo today                            所有项目的今日及逾期待办
 /todo list [all|week|overdue] [--project 项目路径]
 /todo search <关键词> [--done]         搜索标题与描述，加 --done 连已完成一起搜
+/todo show <任务ID>                    看单条任务的全部字段（描述、标签、重复、提醒等）
 /todo move <任务ID> <项目路径>         把任务移到另一个项目
 /todo subtask add <父任务ID> <标题>    新建子任务
 /todo subtask list <任务ID>            查看子任务
@@ -88,6 +94,8 @@ HELP_TEXT = """Vikunja 私人待办秘书（仅支持私聊）
 /todo bulk delete <任务ID,...>         批量删除
 /todo project new <名称> [--parent 父项目]   新建项目
 /todo project rename <项目> <新名称>         重命名项目
+/todo project delete <项目> [--force]        删除项目（连里面的任务一起永久删除，会记入审计）
+/todo audit [条数]                     查看项目删除审计：删过哪些项目、连带删掉了什么
 /todo label list                       列出所有标签
 /todo label add <任务ID,...> <标签,...>      加标签（不存在的标签自动新建）
 /todo label rm <任务ID,...> <标签,...>       摘标签（不会新建）
@@ -115,7 +123,9 @@ HELP_TEXT = """Vikunja 私人待办秘书（仅支持私聊）
 /todo move 12 "fudan-work/SMX/paper"    换个项目
 /todo subtask add 7 写引言              给 #7 加一条子任务
 /todo edit 12 --label +重要,-待定       加“重要”、摘“待定”
+/todo show 12                           查看 #12 的描述、标签、重复规则等
 /todo label add 12 论文                给 #12 加标签，标签不存在会自动建
+/todo audit                             看看删过哪些项目、连带删掉了什么
 /todo push test                         确认提醒通道是通的"""
 
 
@@ -148,6 +158,9 @@ SECRETARY_PROMPT = """
 22. 标签名写错会自动创建一个新标签，所以加标签时用用户原话里的词，不要自己改写、翻译或补全标签名。
 23. 重复规则只能用 daily/weekly/monthly、2d、12h、每3天这类固定间隔，或“完成后2d”（从完成那一刻起算）。用户说“每周一、三、五”“工作日”“每隔一个周五”时，**Vikunja 表达不了**，不要挑一个最像的规则凑上去，要直接告诉用户：可以改成每周固定一天（若截止时间正好是那天，效果相同），或者拆成星期几就建几条任务。
 24. 用户说“这周完成了什么”“总结一下最近”“做个周报”“最近干得怎么样”时，调用 vikunja_stats 统计已完成任务；这是回顾已完成的任务，不是查未完成待办，不要用 vikunja_list_tasks 代替。
+25. 用户说“删掉某个项目”时调用 vikunja_manage_project 并传 action="delete"。删除项目会连里面的任务一起**永久删除且无法恢复**，所以必须先向用户说明后果并得到明确确认，再传 force=true 重新调用。工具在项目非空时会先拒绝一次并给出任务清单——那一步就是让你去问用户的，不是让你换个说法重试；把拒绝理由里的任务清单如实转述给用户，不要只说“里面还有东西”。
+26. 用户问某条任务的详情（“7 号的备注写了什么”“这条设了提醒吗”“它下面有哪些子任务”“描述改成功了没有”）时，调用 vikunja_get_task 查这一条。任务列表里**没有**描述、标签、提醒和子任务，所以不许凭列表或记忆回答这类问题——查不到就说查不到，不要编。
+27. 项目删除会被记进审计。用户问“之前删过哪些项目”“删除记录”时，这件事只有斜杠命令能做：告诉他在这条私聊里发 /todo audit（可以带条数，如 /todo audit 20）。不要假装你能查到。
 
 ## 对话示例
 
@@ -192,6 +205,12 @@ SECRETARY_PROMPT = """
 
 用户：这周完成了什么
 助手：[调用 vikunja_stats，period="week"]
+
+用户：7号的备注写的是什么
+助手：[调用 vikunja_get_task，task_id=7，按返回值如实回答，不凭列表猜]
+
+用户：之前删过哪些项目
+助手：这件事我查不到，请在这条私聊里发 /todo audit 查看（可以带条数，如 /todo audit 20）
 
 用户：还有个待办没做
 助手：[调用查询工具列出未完成任务]
@@ -314,10 +333,52 @@ class VikunjaPlugin(Star):
     async def _resolve_project(
         self, selector: str = ""
     ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+        """把选择器解析成项目。空选择器表示"用默认项目"，见 ``_default_project``。"""
         projects = await self.client.list_projects()
-        target = selector.strip() or str(self.config.get("default_project", "Inbox")).strip()
-        project, path = resolve_project(projects, target)
+        explicit = selector.strip()
+        if explicit:
+            # 用户点名的项目找不到要**报错**，不能悄悄替他改主意。
+            project, path = resolve_project(projects, explicit)
+            return project, path, projects
+        project, path = await self._default_project(projects)
         return project, path, projects
+
+    async def _default_project(
+        self, projects: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], str]:
+        """决定"没写项目时进哪个项目"。
+
+        顺序：配置的 ``default_project`` → 服务端认定的默认项目 → 字面 "Inbox"。
+        配置里那个名字解析不了时**不报错而是继续往下退**：这条路的尽头是"记个待办"最常用的
+        走法，为了一个配错的默认值让整条路断掉，比暂时落到收件箱糟糕得多。落到哪里会显示在
+        创建结果里（"项目：📥 Inbox"），所以退让是看得见的，日志里另外留一条 warning。
+        """
+        configured = str(self.config.get("default_project", "") or "").strip()
+        if configured:
+            try:
+                return resolve_project(projects, configured)
+            except ValueError as exc:
+                logger.warning(f"配置的默认项目 {configured!r} 无法解析（{exc}），改用服务端的默认项目")
+
+        default_id = None
+        try:
+            default_id = await self.client.get_default_project_id()
+        except VikunjaError as exc:
+            logger.warning(f"读取服务端默认项目失败：{exc}")
+        if default_id is not None:
+            for project in projects:
+                if int(project["id"]) == default_id:
+                    return project, build_project_paths(projects)[default_id]
+
+        # 服务端也没给（老版本、或用户把默认项目删了）：退回最朴素的名字查找。忽略装饰的
+        # 匹配在这一档会兜住 "📥 Inbox" 这类改名。
+        try:
+            return resolve_project(projects, "Inbox")
+        except ValueError as exc:
+            # 终点也不能报"找不到项目：Inbox"——用户根本没提过 Inbox，那句话没法照做。
+            raise ValueError(
+                f"没有可用的默认项目，请在配置里指定 default_project（{exc}）"
+            ) from exc
 
     async def _create(
         self,
@@ -614,7 +675,9 @@ class VikunjaPlugin(Star):
             f"父任务：#{spec.parent_id} {parent.get('title', '')}"
         )
 
-    async def _project(self, event: AstrMessageEvent, spec: ProjectSpec) -> str:
+    async def _project(
+        self, event: AstrMessageEvent, spec: ProjectSpec, *, source: str = "command"
+    ) -> str:
         await self._register_channel(event)
         if spec.action == "create":
             parent_id: int | None = None
@@ -625,13 +688,78 @@ class VikunjaPlugin(Star):
             project = await self.client.create_project(spec.name, parent_id)
             title = project.get("title") or spec.name
             return f"✅ 已创建项目 #{project['id']} {parent_path + '/' if parent_path else ''}{title}"
-        project, _, _ = await self._resolve_project(spec.name)
+        project, path, _ = await self._resolve_project(spec.name)
+        if spec.action == "delete":
+            return await self._delete_project(
+                project, path, force=spec.force, source=source
+            )
         updated = await self.client.merge_update_project(
             int(project["id"]), {"title": spec.new_name}
         )
         return (
             f"✅ 已重命名项目 #{updated['id']}："
             f"{project.get('title', '')} → {updated.get('title') or spec.new_name}"
+        )
+
+    async def _delete_project(
+        self,
+        project: dict[str, Any],
+        path: str,
+        *,
+        force: bool,
+        source: str = "command",
+    ) -> str:
+        """删项目。先查里面有什么——服务端会把它们一并**硬删除**且无法恢复。
+
+        默认拒绝非空项目而不是弹个"确认"：聊天里的确认很难做对（下一条消息是什么都可能），
+        而 `--force` 是个必须显式打出来的字，比一次"是/否"回复更难误触。
+
+        无论强制与否都先把任务读出来：不强制时它是给用户看的清单，强制时它是审计记录。
+        删除之后没有任何接口能把任务要回来，所以"删掉了什么"只能在删之前记。
+        """
+        project_id = int(project["id"])
+        # 收件箱也能被删（服务端只拦非所有者），但删掉之后"记个待办"就没有默认项目可用了，
+        # 所以先说明白，别让用户顺手把最常用的那条路拆了。
+        is_default = False
+        try:
+            is_default = await self.client.get_default_project_id() == project_id
+        except VikunjaError:
+            pass
+        default_note = (
+            "\n注意：这是 Vikunja 当前的默认项目，删掉之后没写项目的任务将无处可放，"
+            "需要重新配置 default_project。"
+            if is_default
+            else ""
+        )
+
+        tasks = await self.client.list_tasks(project_id=project_id, include_done=True)
+        if not force and tasks:
+            return (
+                f"⚠️ 项目 {path} (#{project_id}) 里还有 {len(tasks)} 个任务，"
+                f"删除项目会连它们一起**永久删除**（Vikunja 是硬删除，无法恢复）。{default_note}\n"
+                f"共 {len(tasks)} 条：{summarize_task_refs(tasks, len(tasks))}\n"
+                f"确认要删就再执行一次并显式强制：命令加 --force，或调用工具时传 force=true"
+            )
+        await self.client.delete_project(project_id)
+        # 审计写在删除**之后**：写不进去就不该谎称删过。这条记录是硬删除唯一的事后凭据，
+        # 所以此处不吞异常——失败就让它冒到调用方，用户还能看到"删了但没记上"。
+        await self.state.record_project_deletion(
+            {
+                "at": datetime.now(self.tz).strftime("%Y-%m-%d %H:%M"),
+                "project_id": project_id,
+                "path": path,
+                "tasks": len(tasks),
+                "task_refs": [
+                    {"id": task.get("id"), "title": task.get("title", "")}
+                    for task in tasks[:AUDIT_TASK_REF_LIMIT]
+                ],
+                "source": source,
+            }
+        )
+        count_note = f"，连带删掉了 {len(tasks)} 个任务" if tasks else "（项目本来是空的）"
+        return (
+            f"✅ 已删除项目 {path} (#{project_id}){count_note}{default_note}\n"
+            f"🗂 已记入审计，用 /todo audit 可以回看"
         )
 
     async def _move(self, event: AstrMessageEvent, task_id: int, selector: str) -> str:
@@ -1004,6 +1132,55 @@ class VikunjaPlugin(Star):
         except (ValueError, VikunjaError) as exc:
             yield event.plain_result(f"查询失败：{exc}")
 
+    async def _task_detail(self, event: AstrMessageEvent, task_id: int) -> str:
+        """单条任务的完整字段。``/todo show`` 和 ``vikunja_get_task`` 共用这一条路径。"""
+        await self._register_channel(event)
+        task = await self.client.get_task(task_id)
+        # 提醒阈值存在本地 KV 里（不是 Vikunja 的字段），所以只有这里能补上它。
+        overrides = await self.state.task_reminder_overrides()
+        task["_reminder_minutes"] = overrides.get(task_id)
+        projects = await self.client.list_projects()
+        paths = build_project_paths(projects)
+        path = paths.get(int(task.get("project_id") or 0), "未知项目")
+        return format_task_detail(task, path, self.tz)
+
+    @todo.command("show", alias={"详情", "查看"})
+    async def todo_show(self, event: AstrMessageEvent):
+        try:
+            tail = self._command_tail(event)
+            # 空输入先拦下来：parse_task_ids 的报错讲的是"多个 ID 用逗号分隔"，
+            # 而这条命令只收一个 ID，照搬那句话会把人引到错的方向。
+            if not tail:
+                raise ValueError("用法：/todo show <任务ID>")
+            ids = parse_task_ids(tail)
+            if len(ids) != 1:
+                raise ValueError("用法：/todo show <任务ID>（一次只看一条）")
+            yield event.plain_result(await self._task_detail(event, ids[0]))
+        except PrivateOnlyError as exc:
+            yield event.plain_result(str(exc))
+        except (ValueError, VikunjaError) as exc:
+            yield event.plain_result(f"查询失败：{exc}")
+
+    @todo.command("audit", alias={"审计", "删除记录"})
+    async def todo_audit(self, event: AstrMessageEvent):
+        """项目删除审计——删过哪些项目、连带删掉了什么。"""
+        try:
+            await self._register_channel(event)
+            tail = self._command_tail(event).strip()
+            limit = AUDIT_DISPLAY_LIMIT
+            if tail:
+                try:
+                    limit = max(1, min(AUDIT_LIMIT, int(tail)))
+                except ValueError:
+                    raise ValueError("用法：/todo audit [显示条数]")
+            yield event.plain_result(
+                format_deletion_audit(self.state.project_deletions(), limit=limit)
+            )
+        except (PrivateOnlyError, ValueError) as exc:
+            # 权限和用法错误都原样展示，所以合并成一支。以后要给它们加不同的前缀时，
+            # 记得 PrivateOnlyError 必须写在前面——它是 ValueError 的子类。
+            yield event.plain_result(str(exc))
+
     @todo.command("week", alias={"周报", "完成情况"})
     async def todo_week(self, event: AstrMessageEvent):
         try:
@@ -1296,19 +1473,21 @@ class VikunjaPlugin(Star):
         name: str,
         parent: str = "",
         new_name: str = "",
+        force: bool = False,
     ) -> str:
-        """新建项目或重命名已有项目；用户要求“建个项目”“开一个新项目”“把某个项目改名”时调用。
+        """新建项目、重命名已有项目或删除项目；用户要求“建个项目”“开一个新项目”“把某个项目改名”“删掉某个项目”时调用。
 
         Args:
-            action(string): create 表示新建，rename 表示重命名
-            name(string): action=create 时是**新项目的名称**；action=rename 时是要改的现有项目，填完整路径、唯一名称或 ID
+            action(string): create 表示新建，rename 表示重命名，delete 表示删除
+            name(string): action=create 时是**新项目的名称**；action=rename 或 delete 时是要操作的现有项目，填完整路径、唯一名称或 ID
             parent(string): 仅 action=create 时有效，新项目挂到哪个父项目下；建在顶层留空
             new_name(string): 仅 action=rename 时有效，项目的新名称
+            force(boolean): 仅 action=delete 时有效。删除项目会连里面所有任务一起永久删除，所以项目非空时本工具会先拒绝并要求你向用户确认；用户明确确认后再调用并传 true
         """
         try:
             normalized = action.strip().lower()
-            if normalized not in {"create", "rename", "new"}:
-                raise ValueError("action 只能是 create（新建）或 rename（重命名）")
+            if normalized not in {"create", "rename", "new", "delete"}:
+                raise ValueError("action 只能是 create（新建）、rename（重命名）或 delete（删除）")
             # LLM 给的是结构化参数，直接构造 ProjectSpec 就好；不要绕回
             # ``parse_project_arguments`` 再解析一遍文本——引号/反斜杠会被 shlex 二次加工。
             if normalized in {"create", "new"}:
@@ -1317,13 +1496,18 @@ class VikunjaPlugin(Star):
                 spec = ProjectSpec(
                     action="create", name=name.strip(), parent_selector=parent.strip()
                 )
+            elif normalized == "delete":
+                if not name.strip():
+                    raise ValueError("删除项目需要给出项目名称或 ID")
+                spec = ProjectSpec(action="delete", name=name.strip(), force=bool(force))
             else:
                 if not name.strip() or not new_name.strip():
                     raise ValueError("重命名需要同时给出项目和新名称")
                 spec = ProjectSpec(
                     action="rename", name=name.strip(), new_name=new_name.strip()
                 )
-            return await self._project(event, spec)
+            # 标成 tool：删项目是不可逆的，审计里要分得清"我打的命令"和"模型自己删的"。
+            return await self._project(event, spec, source="tool")
         except (ValueError, PrivateOnlyError, VikunjaError) as exc:
             return f"项目操作失败：{exc}"
 
@@ -1353,6 +1537,20 @@ class VikunjaPlugin(Star):
                 )
             normalized = scope.lower() if scope.lower() in {"today", "week", "overdue", "all"} else "today"
             return await self._list(event, normalized, project)
+        except (ValueError, PrivateOnlyError, VikunjaError) as exc:
+            return f"查询失败：{exc}"
+
+    @filter.llm_tool(name="vikunja_get_task")
+    async def vikunja_get_task(self, event: AstrMessageEvent, task_id: int = 0) -> str:
+        """查看单条任务的完整详情：描述、标签、重复规则、提醒提前量、子任务、父任务、完成时间。用户问“某条任务的备注写了什么”“它设了提醒吗”“它有哪些子任务”时调用本工具，不要凭任务列表回答——列表里不含描述。
+
+        Args:
+            task_id(number): 单个 Vikunja 任务 ID，即任务列表中 # 后面的数字；注意不是逗号分隔的列表
+        """
+        try:
+            if int(task_id) <= 0:
+                raise ValueError("请给出要查看的任务 ID（任务列表中 # 后面的数字）")
+            return await self._task_detail(event, int(task_id))
         except (ValueError, PrivateOnlyError, VikunjaError) as exc:
             return f"查询失败：{exc}"
 

@@ -879,6 +879,158 @@ def format_weekly_report(
     return "\n".join(lines)
 
 
+def format_task_detail(
+    task: dict[str, Any],
+    project_path: str,
+    tz: ZoneInfo,
+    now: datetime | None = None,
+) -> str:
+    """单个任务的完整详情。
+
+    列表为了塞得下，只能显示优先级、标题、项目和截止时间——描述、标签、提醒、重复规则
+    和子任务都看不见，于是"备注到底写进去了没有"这种事没法目视复核，只能去网页端翻。
+    这里把列表省略掉的字段全部摊开，逐项都标明"有"还是"没有"，**空字段也照打**：
+    看不到"描述：（无）"就分不清"没写进去"和"这一项没显示"。
+    """
+    now = now or datetime.now(tz)
+    lines = [f"📄 #{task.get('id')} {task.get('title', '')}"]
+
+    status = "✅ 已完成" if task.get("done") else "▫️ 未完成"
+    done_at = from_vikunja_time(task.get("done_at"))
+    if task.get("done") and done_at:
+        status += f"（{done_at.astimezone(tz):%Y-%m-%d %H:%M}）"
+    lines.append(f"状态：{status}")
+
+    lines.append(f"项目：{project_path}")
+
+    priority = int(task.get("priority") or 0)
+    lines.append(f"优先级：P{priority}" if priority else "优先级：无")
+
+    due = from_vikunja_time(task.get("due_date"))
+    if due:
+        due_text = f"{due.astimezone(tz):%Y-%m-%d %H:%M}"
+        # 逾期只在没完成时提示；已完成的任务说"逾期"没有意义。
+        if not task.get("done") and due < now:
+            due_text += "（已逾期）"
+    else:
+        due_text = "无"
+    lines.append(f"截止：{due_text}")
+
+    start = from_vikunja_time(task.get("start_date"))
+    end = from_vikunja_time(task.get("end_date"))
+    if start or end:
+        span = " ~ ".join(
+            moment.astimezone(tz).strftime("%Y-%m-%d %H:%M") if moment else "…"
+            for moment in (start, end)
+        )
+        lines.append(f"起止：{span}")
+
+    lines.append(f"重复：{describe_repeat(task)}")
+
+    reminder_minutes = task.get("_reminder_minutes")
+    if reminder_minutes:
+        lines.append(f"提醒：提前 {int(reminder_minutes)} 分钟")
+    else:
+        lines.append("提醒：跟随全局默认")
+
+    labels = task_label_titles(task)
+    lines.append(f"标签：{'、'.join(labels) if labels else '无'}")
+
+    description = str(task.get("description") or "").strip()
+    lines.append(f"描述：{description if description else '无'}")
+
+    children = subtasks_of(task)
+    if children:
+        lines.append(f"子任务（{len(children)}）：")
+        for child in sorted(children, key=lambda item: (bool(item.get("done")), task_sort_key(item))):
+            mark = "✅" if child.get("done") else "▫️"
+            lines.append(f"  {mark} #{child.get('id')} {child.get('title', '')}")
+    else:
+        lines.append("子任务：无")
+
+    parents = parents_of(task)
+    if parents:
+        names = "、".join(f"#{item.get('id')} {item.get('title', '')}" for item in parents)
+        lines.append(f"父任务：{names}")
+
+    return "\n".join(lines)
+
+
+def describe_repeat(task: dict[str, Any]) -> str:
+    """把 ``repeat_after``/``repeat_mode`` 翻回人能读的规则。"""
+    seconds = int(task.get("repeat_after") or 0)
+    mode = int(task.get("repeat_mode") or 0)
+    if mode == 1:
+        # 这个模式下服务端忽略 repeat_after，所以不能按秒数描述。
+        return "每月同一天"
+    if not seconds:
+        return "不重复"
+    text = f"每 {format_duration(seconds)}"
+    if mode == 2:
+        text += "（从完成时刻起算）"
+    return text
+
+
+def format_duration(seconds: int) -> str:
+    """秒数转成人读的间隔，优先用能整除的最大单位。"""
+    for unit, size in (("天", 86400), ("小时", 3600), ("分钟", 60)):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}秒"
+
+
+# 审计里每个项目最多存这么多条任务引用，显示时再压到更少——记录要留证据，但 KV 不能无限长。
+AUDIT_TASK_REF_LIMIT = 50
+AUDIT_DISPLAY_LIMIT = 10
+AUDIT_TITLE_DISPLAY_LIMIT = 20
+DELETION_SOURCE_LABELS = {"command": "手动命令", "tool": "自然语言"}
+
+
+def summarize_task_refs(
+    refs: list[dict[str, Any]],
+    total: int,
+    *,
+    limit: int = AUDIT_TITLE_DISPLAY_LIMIT,
+) -> str:
+    """审计记录里"删掉的是哪些任务"那一行：``#12 写引言、#15 读论文``。
+
+    ``total`` 是删除当时项目里的真实任务数，``refs`` 只是当时留下来的引用（有上限）。
+    未列出的数量按 ``total`` 算而不是按 ``len(refs)``：否则存储上限会把缺口盖成
+    "还有 0 条"，让一份本该留证据的记录反而报小了。
+    """
+    shown = [f"#{ref.get('id', '?')} {ref.get('title') or '(无标题)'}" for ref in refs[:limit]]
+    if not shown:
+        return "（没有留下任务明细）"
+    text = "、".join(shown)
+    missing = int(total) - len(shown)
+    if missing > 0:
+        text += f" …（还有 {missing} 条未列出）"
+    return text
+
+
+def format_deletion_audit(
+    entries: list[dict[str, Any]], *, limit: int = AUDIT_DISPLAY_LIMIT
+) -> str:
+    """渲染项目删除审计。``entries`` 最近的在前（``StateStore`` 就按这个顺序存）。"""
+    if not entries:
+        return "🗂 还没有删除过项目"
+    shown = list(entries[:limit])
+    header = f"🗂 项目删除审计：共 {len(entries)} 次"
+    if len(entries) > len(shown):
+        header += f"，下面是最新的 {len(shown)} 次"
+    lines = [header]
+    for index, entry in enumerate(shown, start=1):
+        source = DELETION_SOURCE_LABELS.get(str(entry.get("source")), "来源未知")
+        total = int(entry.get("tasks") or 0)
+        lines.append(
+            f"{index}. {entry.get('at') or '?'}  {entry.get('path') or '?'}"
+            f"（#{entry.get('project_id') or '?'}），删掉 {total} 个任务（{source}）"
+        )
+        if total:
+            lines.append("   " + summarize_task_refs(entry.get("task_refs") or [], total))
+    return "\n".join(lines)
+
+
 def build_project_paths(projects: list[dict[str, Any]]) -> dict[int, str]:
     by_id = {int(project["id"]): project for project in projects}
     cache: dict[int, str] = {}
@@ -900,6 +1052,19 @@ def build_project_paths(projects: list[dict[str, Any]]) -> dict[int, str]:
     return cache
 
 
+def project_name_key(value: str) -> str:
+    """项目名比较用的归一化：丢掉 emoji、空格和标点，只留字母/数字/CJK 与路径分隔符。
+
+    项目名常带装饰——服务端建的收件箱是 "Inbox"，但用户很可能在网页端把它改成
+    "📥 Inbox"，而说话时只会念"Inbox"。空格和连字符的差异（"reading list" /
+    "reading-list"）同理，不该让查找失败。
+
+    用 ``isalnum()`` 而不是字符白名单：CJK 字符天然算字母，emoji 和标点都不算，
+    所以中英项目名都走得通，也不用维护一张"什么算装饰"的表。
+    """
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum() or ch == "/")
+
+
 def resolve_project(
     projects: list[dict[str, Any]], selector: str
 ) -> tuple[dict[str, Any], str]:
@@ -911,23 +1076,29 @@ def resolve_project(
     if selector.isdigit() and int(selector) in by_id:
         project = by_id[int(selector)]
         return project, paths[int(selector)]
-    normalized = selector.casefold()
-    path_matches = [pid for pid, path in paths.items() if path.casefold() == normalized]
-    if len(path_matches) == 1:
-        pid = path_matches[0]
-        return by_id[pid], paths[pid]
-    title_matches = [
-        int(project["id"])
-        for project in projects
-        if str(project.get("title", "")).casefold() == normalized
-    ]
-    if len(title_matches) == 1:
-        pid = title_matches[0]
-        return by_id[pid], paths[pid]
-    matches = path_matches or title_matches
-    if matches:
-        choices = "、".join(f"{paths[pid]} (#{pid})" for pid in matches)
-        raise ValueError(f"项目名不唯一，请使用完整路径或 ID：{choices}")
+
+    def describe(pids: list[int]) -> str:
+        return "、".join(f"{paths[pid]} (#{pid})" for pid in pids)
+
+    # 逐档放宽：精确匹配（路径、标题）先跑一遍，全部落空后才用忽略装饰的比较。
+    # 顺序不能反——否则一个装饰差异会盖过某处明明写对了的精确匹配。
+    for key_of in (lambda value: str(value).casefold(), project_name_key):
+        wanted = key_of(selector)
+        path_matches = [pid for pid, path in paths.items() if key_of(path) == wanted]
+        if len(path_matches) == 1:
+            pid = path_matches[0]
+            return by_id[pid], paths[pid]
+        title_matches = [
+            int(project["id"])
+            for project in projects
+            if key_of(project.get("title", "")) == wanted
+        ]
+        if len(title_matches) == 1:
+            pid = title_matches[0]
+            return by_id[pid], paths[pid]
+        matches = path_matches or title_matches
+        if matches:
+            raise ValueError(f"项目名不唯一，请使用完整路径或 ID：{describe(matches)}")
     raise ValueError(f"找不到项目：{selector}。请先查询项目树")
 
 
@@ -1110,29 +1281,34 @@ def parse_bulk_arguments(text: str) -> BulkSpec:
 
 @dataclass(slots=True)
 class ProjectSpec:
-    action: str  # create / rename
+    action: str  # create / rename / delete
     name: str
     parent_selector: str = ""
     new_name: str = ""
+    #: 仅 delete：项目里还有任务时是否照样删。删项目会**硬删除**其中所有任务，
+    #: 所以默认要求项目为空，只有用户显式写 --force 才放行。
+    force: bool = False
 
 
 def parse_project_arguments(text: str) -> ProjectSpec:
-    """解析 ``/todo project new <名称> [--parent 父项目]`` 与 ``rename <项目> <新名称>``。"""
+    """解析 ``/todo project new <名称> [--parent 父项目]``、``rename <项目> <新名称>``、``delete <项目> [--force]``。"""
     try:
         tokens = shlex.split(text)
     except ValueError as exc:
         raise ValueError("参数引号没有闭合") from exc
     if not tokens:
         raise ValueError(
-            "用法：/todo project new <名称> [--parent 父项目] 或 /todo project rename <项目> <新名称>"
+            "用法：/todo project new <名称> [--parent 父项目]、rename <项目> <新名称>、"
+            "delete <项目> [--force]"
         )
     actions = {
         "new": "create", "create": "create", "新建": "create", "创建": "create",
         "rename": "rename", "重命名": "rename", "改名": "rename",
+        "delete": "delete", "rm": "delete", "remove": "delete", "删除": "delete",
     }
     action = actions.get(tokens[0].lower())
     if action is None:
-        raise ValueError("项目动作可用：new 新建、rename 重命名")
+        raise ValueError("项目动作可用：new 新建、rename 重命名、delete 删除")
 
     if action == "rename":
         if len(tokens) < 3:
@@ -1141,6 +1317,21 @@ def parse_project_arguments(text: str) -> ProjectSpec:
         if not new_name:
             raise ValueError("新项目名称不能为空")
         return ProjectSpec(action="rename", name=tokens[1].strip(), new_name=new_name)
+
+    if action == "delete":
+        force = False
+        positional = []
+        for token in tokens[1:]:
+            if token in {"--force", "-f", "强制"}:
+                force = True
+                continue
+            if token.startswith("-"):
+                raise ValueError(f"未知选项：{token}")
+            positional.append(token)
+        name = " ".join(positional).strip()
+        if not name:
+            raise ValueError("用法：/todo project delete <项目> [--force]")
+        return ProjectSpec(action="delete", name=name, force=force)
 
     positional: list[str] = []
     parent_selector = ""

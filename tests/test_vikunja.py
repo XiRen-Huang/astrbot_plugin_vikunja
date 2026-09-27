@@ -288,6 +288,22 @@ class ProjectWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hex_color", body)
 
 
+class ProjectDeleteTests(unittest.IsolatedAsyncioTestCase):
+    """删项目会连带硬删除其下所有任务，所以路径必须准确落在单个项目上。"""
+
+    async def test_delete_uses_delete_on_the_project(self):
+        client = _RecordingClient(SAMPLE_PROJECT)
+        await client.delete_project(3)
+        method, path, _ = client.calls[-1]
+        self.assertEqual((method, path), ("DELETE", "projects/3"))
+
+    async def test_delete_sends_no_body(self):
+        """带 body 的 DELETE 容易被服务端当成另一种语义，这里要的就是光秃秃的删除。"""
+        client = _RecordingClient(SAMPLE_PROJECT)
+        await client.delete_project(3)
+        self.assertIsNone(client.calls[-1][2])
+
+
 class LabelWriteTests(unittest.IsolatedAsyncioTestCase):
     """标签走独立的一组接口，且 ``PUT /tasks/{id}/labels`` 要的是 ID 不是名字。"""
 
@@ -421,6 +437,51 @@ class CompletedSinceTests(unittest.IsolatedAsyncioTestCase):
     async def test_paginates_so_a_busy_week_is_not_truncated(self):
         client = _PagingClient([[{"id": 1}], [{"id": 2}]])
         self.assertEqual(len(await client.list_completed_since()), 2)
+
+
+class _PayloadClient(VikunjaClient):
+    """GET 返回一个固定对象，用来测响应体解析。"""
+
+    def __init__(self, payload):
+        super().__init__("https://todo.example.com", "token")
+        self.payload = payload
+        self.calls = []
+
+    async def _request(self, method, path, *, params=None, json=None):
+        self.calls.append((method, path))
+        return deepcopy(self.payload), {}
+
+
+class DefaultProjectTests(unittest.IsolatedAsyncioTestCase):
+    """``GET /user`` → ``settings.default_project_id``；解析不到的每种形态都要能退回。"""
+
+    async def test_reads_the_settings_subobject(self):
+        client = _PayloadClient({"id": 1, "username": "m", "settings": {"default_project_id": 3}})
+        self.assertEqual(await client.get_default_project_id(), 3)
+        self.assertEqual(client.calls, [("GET", "user")])
+
+    async def test_zero_means_unset_not_project_zero(self):
+        """该字段没有 omitempty，未设置时序列化成 0。把 0 当项目 ID 会去找一个不存在的项目。"""
+        client = _PayloadClient({"settings": {"default_project_id": 0}})
+        self.assertIsNone(await client.get_default_project_id())
+
+    async def test_missing_settings_is_tolerated(self):
+        """老版本 ``GET /user`` 不带 settings——不能因此炸掉创建任务那条路。"""
+        self.assertIsNone(await _PayloadClient({"id": 1}).get_default_project_id())
+
+    async def test_settings_without_the_key_is_tolerated(self):
+        self.assertIsNone(await _PayloadClient({"settings": {}}).get_default_project_id())
+
+    async def test_non_numeric_value_is_tolerated(self):
+        client = _PayloadClient({"settings": {"default_project_id": "说不清"}})
+        self.assertIsNone(await client.get_default_project_id())
+
+    async def test_unexpected_payload_shape_is_tolerated(self):
+        self.assertIsNone(await _PayloadClient(["不是对象"]).get_default_project_id())
+
+    async def test_string_number_is_accepted(self):
+        client = _PayloadClient({"settings": {"default_project_id": "4"}})
+        self.assertEqual(await client.get_default_project_id(), 4)
 
 
 class RelationTests(unittest.IsolatedAsyncioTestCase):

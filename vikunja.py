@@ -189,6 +189,33 @@ class VikunjaClient:
         projects = await self._paged_get("projects", [("per_page", "100")], "项目列表")
         return [project for project in projects if not project.get("is_archived")]
 
+    async def get_default_project_id(self) -> int | None:
+        """服务端认定的"没指定项目时任务归到哪"，取不到返回 ``None``。
+
+        这才是这件事的权威来源：用户创建时服务端把收件箱的 ID 写进 ``DefaultProjectID``
+        （``CreateNewProjectForUser``），用户之后可以随时改，而且**项目名可以随便改**——
+        按名字猜"默认项目"从一开始就是错的。``user_settings`` 里这个字段的说明就是
+        "Project a task is filed under when created without an explicit project"，
+        与本插件的 ``default_project`` 是同一个概念。
+
+        注意 ``user.User`` 上该字段是 ``json:"-"``，只有 ``GET /user`` 返回的 ``settings``
+        子对象才带上它；老版本没有这段结构，所以解析不到就返回 ``None`` 让调用方退回按名字找。
+        """
+        payload, _ = await self._request("GET", "user")
+        if not isinstance(payload, dict):
+            return None
+        settings = payload.get("settings")
+        if not isinstance(settings, dict):
+            return None
+        raw = settings.get("default_project_id")
+        try:
+            project_id = int(raw)
+        except (TypeError, ValueError):
+            return None
+        # 该字段没有 omitempty，未设置时序列化成 0——0 表示"没设默认项目"，不是项目 0。
+        return project_id if project_id > 0 else None
+
+
     async def create_task(self, project_id: int, task: dict[str, Any]) -> dict[str, Any]:
         payload, _ = await self._request("PUT", f"projects/{project_id}/tasks", json=task)
         return payload
@@ -289,6 +316,15 @@ class VikunjaClient:
             body.pop("description", None)
         payload_result, _ = await self._request("POST", f"projects/{project_id}", json=body)
         return payload_result
+
+    async def delete_project(self, project_id: int) -> None:
+        """删除项目。**连带硬删除该项目下的所有任务**（含已软删除的），不可恢复。
+
+        服务端 ``Project.Delete`` 会遍历 ``project_id = ?`` 的任务逐条 ``hardDeleteTask``，
+        注释写得很清楚："there is nothing to restore them into once the project is gone"。
+        所以调用方必须先确认项目是不是空的，别让一次手滑带走整棵子树。
+        """
+        await self._request("DELETE", f"projects/{int(project_id)}")
 
     async def add_relation(
         self, task_id: int, other_task_id: int, relation_kind: str = "subtask"

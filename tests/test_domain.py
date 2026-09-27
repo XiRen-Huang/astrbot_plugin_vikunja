@@ -7,11 +7,14 @@ from todo_domain import (
     build_label_index,
     build_project_paths,
     completed_tasks_since,
+    format_deletion_audit,
     format_weekly_report,
     filter_tasks_by_label,
     filter_tasks_by_query,
+    format_duration,
     format_label_list,
     format_project_tree,
+    format_task_detail,
     format_subtask_list,
     format_task_list,
     is_clear_request,
@@ -39,6 +42,7 @@ from todo_domain import (
     sender_is_allowed,
     select_tasks,
     subtasks_of,
+    summarize_task_refs,
     task_label_titles,
     to_vikunja_time,
 )
@@ -107,6 +111,55 @@ class DomainTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "不唯一"):
             resolve_project(projects, "paper")
+
+    def test_decorated_project_is_found_by_its_plain_name(self):
+        """回归：默认项目配成 "Inbox"，而库里的收件箱叫 "📥 Inbox"（用户在网页端加了装饰）。
+
+        按名字匹配扑空后，空项目创建任务直接失败——"记个待办"这条最常走的路整个断掉。
+        """
+        projects = [
+            {"id": 1, "title": "📥 Inbox", "parent_project_id": 0},
+            {"id": 2, "title": "fudan-work", "parent_project_id": 0},
+        ]
+        project, path = resolve_project(projects, "Inbox")
+        self.assertEqual(project["id"], 1)
+        self.assertEqual(path, "📥 Inbox")
+
+    def test_decoration_insensitive_matching_ignores_spacing_and_punctuation(self):
+        projects = [
+            {"id": 5, "title": "⭐ reading-list", "parent_project_id": 0},
+            {"id": 6, "title": "工作 / 论文", "parent_project_id": 0},
+        ]
+        self.assertEqual(resolve_project(projects, "reading list")[0]["id"], 5)
+        self.assertEqual(resolve_project(projects, "readinglist")[0]["id"], 5)
+        self.assertEqual(resolve_project(projects, "工作/论文")[0]["id"], 6)
+
+    def test_exact_match_still_wins_over_a_decorated_neighbour(self):
+        """放宽匹配只能在精确匹配全部落空之后跑，否则它会抢走写对了的查询。"""
+        projects = [
+            {"id": 1, "title": "📥 Inbox", "parent_project_id": 0},
+            {"id": 2, "title": "Inbox", "parent_project_id": 0},
+        ]
+        self.assertEqual(resolve_project(projects, "Inbox")[0]["id"], 2)
+
+    def test_decoration_insensitive_ambiguity_is_still_reported(self):
+        projects = [
+            {"id": 1, "title": "📥 Inbox", "parent_project_id": 0},
+            {"id": 2, "title": "inbox", "parent_project_id": 0},
+        ]
+        with self.assertRaisesRegex(ValueError, "不唯一"):
+            resolve_project(projects, "IN BOX")
+
+    def test_project_ids_are_unaffected_by_the_loose_tier(self):
+        projects = [{"id": 7, "title": "📥 Inbox", "parent_project_id": 0}]
+        self.assertEqual(resolve_project(projects, "7")[0]["id"], 7)
+        with self.assertRaisesRegex(ValueError, "找不到项目"):
+            resolve_project(projects, "9")
+
+    def test_unknown_project_still_reports_not_found(self):
+        projects = [{"id": 1, "title": "📥 Inbox", "parent_project_id": 0}]
+        with self.assertRaisesRegex(ValueError, "找不到项目"):
+            resolve_project(projects, "不存在的项目")
 
     def test_secretary_guard_combines_missing_information(self):
         reason = secretary_clarification_reason(
@@ -553,6 +606,30 @@ class ParseProjectArgumentsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_project_arguments("destroy x")
 
+    def test_delete_without_force_defaults_to_safe(self):
+        """force 默认必须是 False：删项目会硬删除其中所有任务，不能默认放行。"""
+        spec = parse_project_arguments("delete z测试")
+        self.assertEqual((spec.action, spec.name, spec.force), ("delete", "z测试", False))
+
+    def test_delete_with_force(self):
+        spec = parse_project_arguments("delete reading-list --force")
+        self.assertEqual((spec.action, spec.name, spec.force), ("delete", "reading-list", True))
+
+    def test_delete_accepts_chinese_aliases(self):
+        spec = parse_project_arguments("删除 z测试 -f")
+        self.assertEqual((spec.action, spec.name, spec.force), ("delete", "z测试", True))
+
+    def test_delete_accepts_a_multi_word_name(self):
+        self.assertEqual(parse_project_arguments("delete 阅读 清单").name, "阅读 清单")
+
+    def test_delete_needs_a_name(self):
+        with self.assertRaises(ValueError):
+            parse_project_arguments("delete --force")
+
+    def test_delete_rejects_unknown_options(self):
+        with self.assertRaises(ValueError):
+            parse_project_arguments("delete x --nope")
+
 
 class ParseMoveArgumentsTests(unittest.TestCase):
     def test_parses_id_and_selector(self):
@@ -851,6 +928,116 @@ class EditLabelFlagTests(unittest.TestCase):
             parse_edit_arguments("12 --label", self.TZ)
 
 
+class TaskDetailTests(unittest.TestCase):
+    """列表省略掉的字段必须在详情里全部摊开——"备注到底写进去没有"要靠这里复核。"""
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    NOW = datetime(2026, 7, 12, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def _task(self, **overrides):
+        task = {
+            "id": 12,
+            "title": "修改论文引言",
+            "done": False,
+            "project_id": 3,
+            "priority": 4,
+            "due_date": "2026-07-13T02:00:00Z",
+            "repeat_after": 0,
+            "repeat_mode": 0,
+            "labels": [{"id": 2, "title": "重要"}],
+            "related_tasks": {},
+        }
+        task.update(overrides)
+        return task
+
+    def _detail(self, task=None, **kwargs):
+        return format_task_detail(
+            task if task is not None else self._task(),
+            "fudan-work/SMX/paper",
+            self.TZ,
+            self.NOW,
+            **kwargs,
+        )
+
+    def test_shows_the_description(self):
+        """这条就是这次新增该命令的理由。"""
+        text = self._detail(self._task(description="设计稿在 FluidCapsule 里"))
+        self.assertIn("描述：设计稿在 FluidCapsule 里", text)
+
+    def test_an_empty_description_is_shown_as_empty_not_hidden(self):
+        """不打印空字段就分不清"没写进去"和"这一行没显示"。"""
+        self.assertIn("描述：无", self._detail())
+
+    def test_shows_labels_repeat_and_priority(self):
+        text = self._detail(self._task(repeat_after=172800, repeat_mode=0))
+        self.assertIn("标签：重要", text)
+        self.assertIn("重复：每 2天", text)
+        self.assertIn("优先级：P4", text)
+
+    def test_monthly_repeat_is_not_described_by_seconds(self):
+        """mode=1 时服务端忽略 repeat_after，按秒数说会讲错。"""
+        text = self._detail(self._task(repeat_after=0, repeat_mode=1))
+        self.assertIn("重复：每月同一天", text)
+
+    def test_completion_relative_repeat_is_labelled(self):
+        text = self._detail(self._task(repeat_after=172800, repeat_mode=2))
+        self.assertIn("从完成时刻起算", text)
+
+    def test_no_repeat_says_so(self):
+        self.assertIn("重复：不重复", self._detail())
+
+    def test_due_time_is_converted_to_local(self):
+        self.assertIn("截止：2026-07-13 10:00", self._detail())
+
+    def test_overdue_is_flagged_only_while_unfinished(self):
+        task = self._task(due_date="2026-07-10T02:00:00Z")
+        self.assertIn("已逾期", self._detail(task))
+        self.assertNotIn("已逾期", self._detail({**task, "done": True}))
+
+    def test_reminder_threshold_comes_from_the_passed_in_value(self):
+        self.assertIn("提醒：跟随全局默认", self._detail())
+        self.assertIn("提醒：提前 30 分钟", self._detail(self._task(_reminder_minutes=30)))
+
+    def test_subtasks_are_listed(self):
+        task = self._task(
+            related_tasks={"subtask": [{"id": 15, "title": "写引言", "done": True}]}
+        )
+        text = self._detail(task)
+        self.assertIn("子任务（1）：", text)
+        self.assertIn("#15 写引言", text)
+
+    def test_no_subtasks_is_stated(self):
+        self.assertIn("子任务：无", self._detail())
+
+    def test_parent_task_is_listed(self):
+        task = self._task(related_tasks={"parenttask": [{"id": 7, "title": "论文"}]})
+        self.assertIn("父任务：#7 论文", self._detail(task))
+
+    def test_done_task_shows_when_it_was_completed(self):
+        text = self._detail(self._task(done=True, done_at="2026-07-11T02:00:00Z"))
+        self.assertIn("✅ 已完成（2026-07-11 10:00）", text)
+
+    def test_whatever_path_the_caller_resolved_is_printed_verbatim(self):
+        """格式化函数不认识项目，路径由调用方解析（main.py 在项目缺失时传"未知项目"）。"""
+        text = format_task_detail(self._task(), "未知项目", self.TZ, self.NOW)
+        self.assertIn("项目：未知项目", text)
+
+
+class DurationFormatTests(unittest.TestCase):
+    def test_largest_exact_unit_wins(self):
+        self.assertEqual(format_duration(86400), "1天")
+        self.assertEqual(format_duration(172800), "2天")
+        self.assertEqual(format_duration(7200), "2小时")
+        self.assertEqual(format_duration(1800), "30分钟")
+
+    def test_remainders_fall_through_to_seconds(self):
+        """不能四舍五入——把 3601 秒说成"1小时"会让重复任务慢慢跑偏。"""
+        self.assertEqual(format_duration(3601), "3601秒")
+
+    def test_hours_win_over_minutes_when_they_divide_evenly(self):
+        self.assertEqual(format_duration(90000), "25小时")
+
+
 class CompletedSinceTests(unittest.TestCase):
     """``done_at`` 的零值防线——⑫ 周报的正确性全靠它。"""
 
@@ -954,6 +1141,86 @@ class WeeklyReportTests(unittest.TestCase):
     def test_single_day_window_labels_itself_correctly(self):
         text = self._report([self._completed(1, "2026-07-12T02:00:00Z")], days=1)
         self.assertIn("最近 1 天", text)
+
+
+class TaskRefSummaryTests(unittest.TestCase):
+    """``summarize_task_refs``——审计里"删掉的是哪些任务"那一行。"""
+
+    def _refs(self, count, start=1):
+        return [{"id": index, "title": f"任务{index}"} for index in range(start, start + count)]
+
+    def test_names_every_task_when_it_fits(self):
+        self.assertEqual(summarize_task_refs(self._refs(2), 2), "#1 任务1、#2 任务2")
+
+    def test_missing_title_does_not_render_as_none(self):
+        text = summarize_task_refs([{"id": 7, "title": ""}], 1)
+        self.assertEqual(text, "#7 (无标题)")
+
+    def test_display_limit_reports_the_remainder(self):
+        text = summarize_task_refs(self._refs(5), 5, limit=2)
+        self.assertIn("#1 任务1、#2 任务2", text)
+        self.assertIn("还有 3 条未列出", text)
+
+    def test_remainder_counts_against_the_true_total_not_the_stored_refs(self):
+        """存储上限截断过引用时，缺口要按真实任务数算，否则"还有 0 条"会把缺口盖掉。"""
+        text = summarize_task_refs(self._refs(3), 40)
+        self.assertIn("还有 37 条未列出", text)
+
+    def test_empty_refs_says_so_instead_of_rendering_nothing(self):
+        self.assertIn("没有留下任务明细", summarize_task_refs([], 4))
+
+
+class DeletionAuditTests(unittest.TestCase):
+    def _entry(self, **overrides):
+        entry = {
+            "at": "2026-09-27 14:20",
+            "project_id": 7,
+            "path": "reading-list",
+            "tasks": 2,
+            "task_refs": [{"id": 12, "title": "写引言"}, {"id": 15, "title": "读论文"}],
+            "source": "command",
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_no_deletions_yet(self):
+        self.assertIn("还没有删除过项目", format_deletion_audit([]))
+
+    def test_entry_shows_time_path_and_count(self):
+        text = format_deletion_audit([self._entry()])
+        self.assertIn("2026-09-27 14:20", text)
+        self.assertIn("reading-list", text)
+        self.assertIn("#7", text)
+        self.assertIn("删掉 2 个任务", text)
+
+    def test_task_titles_are_listed(self):
+        text = format_deletion_audit([self._entry()])
+        self.assertIn("#12 写引言", text)
+        self.assertIn("#15 读论文", text)
+
+    def test_source_distinguishes_command_from_natural_language(self):
+        """审计要分得清是"我打的命令"还是"模型自己删的"。"""
+        self.assertIn("手动命令", format_deletion_audit([self._entry()]))
+        self.assertIn("自然语言", format_deletion_audit([self._entry(source="tool")]))
+
+    def test_unknown_source_is_not_silently_blank(self):
+        self.assertIn("来源未知", format_deletion_audit([self._entry(source="???")]))
+
+    def test_empty_project_skips_the_task_line(self):
+        text = format_deletion_audit([self._entry(tasks=0, task_refs=[])])
+        self.assertIn("删掉 0 个任务", text)
+        self.assertNotIn("没有留下任务明细", text)
+
+    def test_overflow_announces_how_many_are_hidden(self):
+        entries = [self._entry() for _ in range(3)]
+        text = format_deletion_audit(entries, limit=2)
+        self.assertIn("共 3 次", text)
+        self.assertIn("最新的 2 次", text)
+        self.assertEqual(text.count("2026-09-27 14:20"), 2)
+
+    def test_missing_fields_do_not_crash(self):
+        text = format_deletion_audit([{}])
+        self.assertIn("来源未知", text)
 
 
 if __name__ == "__main__":

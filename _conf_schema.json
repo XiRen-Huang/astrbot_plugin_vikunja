@@ -16,8 +16,8 @@
   "default_project": {
     "description": "默认项目",
     "type": "string",
-    "hint": "未指定项目的日常琐事进入这里。可填写完整路径、唯一名称或项目 ID。",
-    "default": "Inbox"
+    "hint": "未指定项目的日常琐事进入这里。可填写完整路径、唯一名称或项目 ID；留空则使用 Vikunja 自己记录的默认项目（推荐，改过收件箱名字也不会失配）。项目名匹配会忽略 emoji、空格和标点，所以填 Inbox 也能找到“📥 Inbox”。",
+    "default": ""
   },
   "allowed_qq_sender_ids": {
     "description": "允许使用插件的 QQ 发送者 ID",

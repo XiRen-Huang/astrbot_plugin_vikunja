@@ -221,6 +221,7 @@ class PluginToolSchemaTests(unittest.TestCase):
                 "vikunja_delete_task",
                 "vikunja_manage_project",
                 "vikunja_list_tasks",
+                "vikunja_get_task",
                 "vikunja_stats",
             ],
         )
@@ -302,7 +303,16 @@ class PluginToolSchemaTests(unittest.TestCase):
         docstring, params = self._tool("vikunja_manage_project")
         summary = [line for line in (docstring or "").split("\n\n")[0].splitlines() if line.strip()]
         self.assertEqual(len(summary), 1)
-        self.assertEqual(params, ["self", "event", "action", "name", "parent", "new_name"])
+        self.assertEqual(
+            params, ["self", "event", "action", "name", "parent", "new_name", "force"]
+        )
+
+    def test_get_task_takes_a_single_id(self):
+        """详情只查一条：参数是单数 task_id，不能和改写工具的 task_ids 混成同一个。"""
+        docstring, params = self._tool("vikunja_get_task")
+        summary = [line for line in (docstring or "").split("\n\n")[0].splitlines() if line.strip()]
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(params, ["self", "event", "task_id"])
 
     def test_stats_tool_takes_a_period(self):
         docstring, params = self._tool("vikunja_stats")
